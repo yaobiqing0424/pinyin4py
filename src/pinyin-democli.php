@@ -2,7 +2,7 @@
 require_once dirname(__FILE__) . '/aps/aps-client.php';
 $context = new ZMQContext();
 
-$client = new APSClient($context, array('tcp://192.168.201.109:50000'));
+$client = new APSClient($context, array('tcp://10.10.6.219:50000'));
 
 $client->start_request('convert', array('你好世界'),
     function($reply, $status) {

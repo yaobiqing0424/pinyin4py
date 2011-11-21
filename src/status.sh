@@ -1,0 +1,1 @@
+python status.py ipc:///tmp/pinyin-backend.ipc
