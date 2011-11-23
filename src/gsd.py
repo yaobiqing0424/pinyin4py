@@ -13,15 +13,53 @@ import msgpack
 import zmq
 import errno
 import logging
+import socket
+import threading
 
 VERSION = r'APS10'
 EMPTY = r''
+SERVICE_NAME = r'pinyin'
 
 def microtime():
     return int(round(time.time() * 1000 * 1000))
 
 def millitime():
     return int(round(time.time() * 1000))
+
+class Connector(threading.Thread):
+
+    def __init__(self, host, port, name, endpoint, event):
+        super(Connector, self).__init__()
+
+        self.host     = host
+        self.port     = port
+        self.name     = name
+        self.endpoint = endpoint
+        self.event    = event
+
+    def run(self):
+
+        while self.event.is_set():
+            s = socket.socket()
+
+            try:
+                s.connect((self.host, self.port))
+            except socket.error: # fail to connect
+                s.close()
+                time.sleep(1)
+                continue
+
+            s.send('%s\t%s\n' % (self.name, self.endpoint))
+            s.settimeout(1)
+
+            while self.event.is_set():
+                try:
+                    s.recv(0)
+                except socket.timeout:
+                    continue
+                s.close() # lose connection
+                break
+
 
 class Workers:
     def __init__(self):
@@ -159,11 +197,19 @@ class Device():
         self.num_responses = 0
         self.num_forks     = 0
 
+        # initiate Event object
+        self.event = threading.Event()
+        self.event.set()
+
+        # start connector
+        Connector(self.options.host, self.options.port, SERVICE_NAME, self.options.feps[0], self.event).start()
+
         logging.info(self.options.__dict__)
         self.loop()
 
     def stop(self):
         self.interrupted = True
+        self.event.clear()
 
     def maintain(self):
         now = millitime()
@@ -185,11 +231,12 @@ class Device():
         for wid in self.workers.expired_list(now - self.options.expire * 60 * 1000, self.workers.num() - self.options.minw):
             self.remove_worker(wid)
             logging.info('remove expired %s', wid)
+            break
 
         # remove extra spare workers
-        for wid in self.workers.extra_spare(self.workers.num_spare() - self.options.spaw):
+        '''for wid in self.workers.extra_spare(self.workers.num_spare() - self.options.spaw):
             self.remove_worker(wid)
-            logging.info('remove extra spare %s', wid)
+            logging.info('remove extra spare %s', wid)'''
 
         # create new workers
         for i in xrange(self.workers.num(), self.options.minw + 1): # plus one for removing expired worker
@@ -371,6 +418,12 @@ options:
     -e, --expire=<minutes>
         Worker will be killed after the given minutes since creation [default 10]
 
+    -o, --host=<host>
+        Registry host
+
+    -p, --port=<port>
+        Registry port
+
     -d, --daemon
 
     -v, --verbose
@@ -388,6 +441,8 @@ options:
         self.timeout  = 10000 # worker timeout (miliseconds)
         self.interval = 1000  # maintain interval (miliseconds)
         self.expire   = 10    # worker expire time (minutes)
+        self.host     = '127.0.0.1'
+        self.port     = 60001
         self.daemon   = False # daemon
         self.args     = []    # worker command line
 
@@ -416,11 +471,13 @@ options:
         if not self.beps:
             self.beps = ['ipc:///tmp/gsd-%d.ipc' % self.pid]
 
+
     def parse(self, argv):
-        opts, self.args = getopt.getopt(argv[1:], 'hf:b:m:n:x:s:t:i:e:dv', ['help',
+        opts, self.args = getopt.getopt(argv[1:], 'hf:b:m:n:x:s:t:i:e:o:p:dv', ['help',
             'frontend=', 'backend=', 'monitor=',
             'min-worker=', 'max-worker=', 'spare-worker=',
             'timeout=', 'interval=', 'expire=',
+            'host=', 'port=',
             'daemon=', 'verbose='])
 
         for o, a in opts:
@@ -446,6 +503,10 @@ options:
                 self.interval = int(a)
             elif o in ('-e', '--expire='):
                 self.expire = int(a)
+            elif o in ('-o', '--host='):
+                self.host = a
+            elif o in ('-p', '--port='):
+                self.port = int(a)
             elif o in ('-d', '--daemon'):
                 self.daemon = True
             elif o in ('-v', '--verbose'):
