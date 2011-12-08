@@ -28,13 +28,14 @@ def millitime():
 
 class Connector(threading.Thread):
 
-    def __init__(self, host, port, name, endpoint, event):
+    def __init__(self, host, port, name, endpoint, weight, event):
         super(Connector, self).__init__()
 
         self.host     = host
         self.port     = port
         self.name     = name
         self.endpoint = endpoint
+        self.weight   = weight
         self.event    = event
 
     def run(self):
@@ -49,7 +50,7 @@ class Connector(threading.Thread):
                 time.sleep(1)
                 continue
 
-            s.send('%s\t%s\n' % (self.name, self.endpoint))
+            s.send('%s\t%s\t%d\n' % (self.name, self.endpoint, self.weight))
             s.settimeout(1)
 
             while self.event.is_set():
@@ -202,7 +203,7 @@ class Device():
         self.event.set()
 
         # start connector
-        Connector(self.options.host, self.options.port, SERVICE_NAME, self.options.feps[0], self.event).start()
+        Connector(self.options.host, self.options.port, SERVICE_NAME, self.options.feps[0], self.options.weight, self.event).start()
 
         logging.info(self.options.__dict__)
         self.loop()
@@ -424,6 +425,9 @@ options:
     -p, --port=<port>
         Registry port
 
+    -w, --weight=<weight>
+        Service weight
+
     -d, --daemon
 
     -v, --verbose
@@ -442,7 +446,8 @@ options:
         self.interval = 1000  # maintain interval (miliseconds)
         self.expire   = 10    # worker expire time (minutes)
         self.host     = '127.0.0.1'
-        self.port     = 60001
+        self.port     = 50001
+        self.weight   = 1
         self.daemon   = False # daemon
         self.args     = []    # worker command line
 
@@ -473,11 +478,11 @@ options:
 
 
     def parse(self, argv):
-        opts, self.args = getopt.getopt(argv[1:], 'hf:b:m:n:x:s:t:i:e:o:p:dv', ['help',
+        opts, self.args = getopt.getopt(argv[1:], 'hf:b:m:n:x:s:t:i:e:o:p:w:dv', ['help',
             'frontend=', 'backend=', 'monitor=',
             'min-worker=', 'max-worker=', 'spare-worker=',
             'timeout=', 'interval=', 'expire=',
-            'host=', 'port=',
+            'host=', 'port=', 'weight=',
             'daemon=', 'verbose='])
 
         for o, a in opts:
@@ -497,16 +502,18 @@ options:
                 self.maxw = int(a)
             elif o in ('-s', '--spare-worker'):
                 self.spaw = int(a)
-            elif o in ('-t', '--timeout='):
+            elif o in ('-t', '--timeout'):
                 self.timeout = int(a)
-            elif o in ('-i', '--interval='):
+            elif o in ('-i', '--interval'):
                 self.interval = int(a)
-            elif o in ('-e', '--expire='):
+            elif o in ('-e', '--expire'):
                 self.expire = int(a)
-            elif o in ('-o', '--host='):
+            elif o in ('-o', '--host'):
                 self.host = a
-            elif o in ('-p', '--port='):
+            elif o in ('-p', '--port'):
                 self.port = int(a)
+            elif o in ('-w', '--weight'):
+                self.weight = int(a)
             elif o in ('-d', '--daemon'):
                 self.daemon = True
             elif o in ('-v', '--verbose'):
