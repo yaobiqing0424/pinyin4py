@@ -14,53 +14,16 @@ import zmq
 import errno
 import logging
 import socket
-import threading
+import pyinotify
 
 VERSION = r'APS10'
 EMPTY = r''
-SERVICE_NAME = r'pinyin'
 
 def microtime():
     return int(round(time.time() * 1000 * 1000))
 
 def millitime():
     return int(round(time.time() * 1000))
-
-class Connector(threading.Thread):
-
-    def __init__(self, host, port, name, endpoint, weight, event):
-        super(Connector, self).__init__()
-
-        self.host     = host
-        self.port     = port
-        self.name     = name
-        self.endpoint = endpoint
-        self.weight   = weight
-        self.event    = event
-
-    def run(self):
-
-        while self.event.is_set():
-            s = socket.socket()
-
-            try:
-                s.connect((self.host, self.port))
-            except socket.error: # fail to connect
-                s.close()
-                time.sleep(1)
-                continue
-
-            s.send('%s\t%s\t%d\n' % (self.name, self.endpoint, self.weight))
-            s.settimeout(1)
-
-            while self.event.is_set():
-                try:
-                    s.recv(0)
-                except socket.timeout:
-                    continue
-                s.close() # lose connection
-                break
-
 
 class Workers:
     def __init__(self):
@@ -98,7 +61,9 @@ class Workers:
         '''
         make it impossible to add or borrow this worker
         '''
-        self.workers[wid][2] = False
+        if wid in self.workers:
+            self.workers[wid][2] = False
+
         try:
             self.queue.remove(wid)
         except ValueError, e:
@@ -154,17 +119,21 @@ class Device():
         self.workers = Workers()
         self.pendings = deque()
         self.pids = set()
+        self.host = socket.gethostname()
 
-        def create_socket(socktype, endpoints):
+        def create_socket(socktype, endpoints,flag):
             socket = zmq.Socket(zmq.Context.instance(), socktype)
             socket.setsockopt(zmq.LINGER, 0)
             for endpoint in endpoints:
-                socket.bind(endpoint)
+                if flag==1:
+                    socket.bind(endpoint)
+                else:
+                    socket.connect(endpoint)
             return socket
 
-        self.client_socket = create_socket(zmq.XREP, self.options.feps)
-        self.worker_socket = create_socket(zmq.XREP, self.options.beps)
-        self.monitor_socket = create_socket(zmq.PUB, self.options.meps)
+        self.client_socket = create_socket(zmq.XREP, self.options.feps,1)
+        self.worker_socket = create_socket(zmq.XREP, self.options.beps,1)
+        self.monitor_socket = create_socket(zmq.PUB, self.options.meps,2)
 
         self.interrupted = False
         self.last_maintain = 0
@@ -189,6 +158,8 @@ class Device():
             for pid in self.pids:
                 os.kill(pid, signum)
             self.stop()
+            self.close()
+
 
     def start(self):
 
@@ -198,25 +169,46 @@ class Device():
         self.num_responses = 0
         self.num_forks     = 0
 
-        # initiate Event object
-        self.event = threading.Event()
-        self.event.set()
+        # start watching file
+        if self.options.release:
+            wm = pyinotify.WatchManager()
+            notifier = pyinotify.ThreadedNotifier(wm, EventHandler(self.options.release, self.options.beps[0]))
+            notifier.start()
+            wdd = wm.add_watch(os.path.dirname(self.options.release), pyinotify.IN_MODIFY)
 
-        # start connector
-        Connector(self.options.host, self.options.port, SERVICE_NAME, self.options.feps[0], self.options.weight, self.event).start()
-
+        # start looping
         logging.info(self.options.__dict__)
-        self.loop()
+        try:
+            self.loop()
+        except:
+            self.close()
+
+        # stop watching
+        if self.options.release:
+            wm.rm_watch(wdd.values())
+            notifier.stop()
+
+    def close(self):
+        self.client_socket.close()
+        self.worker_socket.close()
+        self.monitor_socket.close()
+        logging.error("program crash")
 
     def stop(self):
         self.interrupted = True
-        self.event.clear()
 
     def maintain(self):
         now = millitime()
 
         if now - self.last_maintain < self.options.interval:
             return
+
+
+        # pub a message to monitor
+        if self.options.meps:
+            frames = self.build_monitor_reply()
+            self.monitor_socket.send_multipart(frames)
+
 
         # remove dead workers
         for wid in self.workers.dead_since(now - self.options.timeout):
@@ -235,9 +227,9 @@ class Device():
             break
 
         # remove extra spare workers
-        '''for wid in self.workers.extra_spare(self.workers.num_spare() - self.options.spaw):
-            self.remove_worker(wid)
-            logging.info('remove extra spare %s', wid)'''
+        # for wid in self.workers.extra_spare(self.workers.num_spare() - self.options.spaw):
+        #    self.remove_worker(wid)
+        #    logging.info('remove extra spare %s', wid)
 
         # create new workers
         for i in xrange(self.workers.num(), self.options.minw + 1): # plus one for removing expired worker
@@ -249,6 +241,11 @@ class Device():
         self.workers.disable(wid)
         frames = [wid, EMPTY, VERSION, '\x02']
         self.worker_socket.send_multipart(frames)
+
+    def remove_all_workers(self):
+        logging.info('Restarting - remove %d workers.' % len(self.pids))
+        for pid in self.pids:
+            self.remove_worker(str(pid))
 
     def fork_worker(self):
         if len(self.pids) < self.options.maxw:
@@ -275,9 +272,18 @@ class Device():
 
             for socket, flags in events:
                 if socket == self.worker_socket:
-                    self.handle_worker()
+                    try:
+                        self.handle_worker()
+                    except:
+                        logging.info('worker format error')
+                        pass
+
                 elif socket == self.client_socket:
-                    self.handle_client()
+                    try:
+                        self.handle_client()
+                    except:
+                        logging.info('client format error')
+                        pass
                 else:
                     assert False
 
@@ -294,7 +300,12 @@ class Device():
             self.forward_to_worker(frames)
 
     def forward_to_worker(self, frames):
-        i = frames.index(EMPTY)
+        try:
+            i = frames.index(EMPTY)
+        except:
+            logging.info('client format error')
+            pass
+
         if frames[i+1] != VERSION:
             pass # handle version mismatch
         sequence, timestamp, expiry = msgpack.unpackb(frames[i+2])
@@ -354,6 +365,9 @@ class Device():
                 frames = self.build_status_reply(wid)
                 self.worker_socket.send_multipart(frames)
 
+            elif command == '\x04': # RESTART
+                self.remove_all_workers()
+
             else:
                 pass # handle unknown command
 
@@ -381,6 +395,34 @@ class Device():
                        str(self.num_forks),
                        str(self.workers.num())])
         return frames
+
+    def build_monitor_reply(self):
+
+        frames = ['monitor', EMPTY, VERSION]
+        frames.extend([str(self.host),
+                       str(self.options.pid),
+                       self.options.feps[0],
+                       str(self.start_time),
+                       str(self.num_requests),
+                       str(self.num_responses),
+                       str(self.num_forks),
+                       str(self.workers.num())])
+        return frames
+
+
+class EventHandler(pyinotify.ProcessEvent):
+
+    def __init__(self, pathname, bep):
+        self.pathname = pathname
+        self.bep = bep
+        super(EventHandler, self).__init__()
+
+    def process_IN_MODIFY(self, event):
+        if event.pathname == self.pathname:
+            socket = zmq.Socket(zmq.Context.instance(), zmq.PUSH)
+            socket.connect(self.bep)
+            socket.send_multipart([EMPTY, VERSION, '\x04'])
+            socket.close()
 
 
 class Options:
@@ -419,14 +461,8 @@ options:
     -e, --expire=<minutes>
         Worker will be killed after the given minutes since creation [default 10]
 
-    -o, --host=<host>
-        Registry host
-
-    -p, --port=<port>
-        Registry port
-
-    -w, --weight=<weight>
-        Service weight
+    -r, --release=<path>
+        Restart workers when the status of file has changed.
 
     -d, --daemon
 
@@ -445,9 +481,7 @@ options:
         self.timeout  = 10000 # worker timeout (miliseconds)
         self.interval = 1000  # maintain interval (miliseconds)
         self.expire   = 10    # worker expire time (minutes)
-        self.host     = '127.0.0.1'
-        self.port     = 50001
-        self.weight   = 1
+        self.release  = None  # release version file
         self.daemon   = False # daemon
         self.args     = []    # worker command line
 
@@ -457,6 +491,11 @@ options:
             self.parse(argv)
         except:
             self.usage()
+            self.errno = 1
+            return
+
+        if self.release and not os.path.isfile(self.release):
+            print '%s does not exist.' % self.release
             self.errno = 1
             return
 
@@ -476,13 +515,11 @@ options:
         if not self.beps:
             self.beps = ['ipc:///tmp/gsd-%d.ipc' % self.pid]
 
-
     def parse(self, argv):
-        opts, self.args = getopt.getopt(argv[1:], 'hf:b:m:n:x:s:t:i:e:o:p:w:dv', ['help',
+        opts, self.args = getopt.getopt(argv[1:], 'hf:b:m:n:x:s:t:i:e:r:dv', ['help',
             'frontend=', 'backend=', 'monitor=',
             'min-worker=', 'max-worker=', 'spare-worker=',
             'timeout=', 'interval=', 'expire=',
-            'host=', 'port=', 'weight=',
             'daemon=', 'verbose='])
 
         for o, a in opts:
@@ -508,12 +545,8 @@ options:
                 self.interval = int(a)
             elif o in ('-e', '--expire'):
                 self.expire = int(a)
-            elif o in ('-o', '--host'):
-                self.host = a
-            elif o in ('-p', '--port'):
-                self.port = int(a)
-            elif o in ('-w', '--weight'):
-                self.weight = int(a)
+            elif o in ('-r', '--release'):
+                self.release = a
             elif o in ('-d', '--daemon'):
                 self.daemon = True
             elif o in ('-v', '--verbose'):
